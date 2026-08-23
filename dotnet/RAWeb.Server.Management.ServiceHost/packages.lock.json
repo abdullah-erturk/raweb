@@ -1,0 +1,112 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0-windows7.0": {
+      "Microsoft.DotNet.ILCompiler": {
+        "type": "Direct",
+        "requested": "[10.0.11, )",
+        "resolved": "10.0.11",
+        "contentHash": "yloFUsIQOzspIsn2cDHrbgikKaWHAZspzj0EWxnWJJpFC89IBW64OXgCECsrrnzGWQvy1iLX9r5/R4zBf7Am3g=="
+      },
+      "Microsoft.NET.ILLink.Tasks": {
+        "type": "Direct",
+        "requested": "[10.0.11, )",
+        "resolved": "10.0.11",
+        "contentHash": "IBf7lbovvjGWVWXZX5cJ/cO0WXbId0Zq4BuSeT94mGZuOAP66oMeH9PTBZ9Jpp3Jb6jtK0qm/NyUbPRo1gC/wQ=="
+      },
+      "System.ServiceProcess.ServiceController": {
+        "type": "Direct",
+        "requested": "[10.0.8, )",
+        "resolved": "10.0.8",
+        "contentHash": "/uCAiixsCUMBsxB7JTjE13RHvDJLq+BVL2toA+ItMMgJ6O07CtljbCoQF2RZ/9jO1RgC35FTGnQo5IAecE4JuQ==",
+        "dependencies": {
+          "System.Diagnostics.EventLog": "10.0.8"
+        }
+      },
+      "AF.Securify.ShellLink": {
+        "type": "Transitive",
+        "resolved": "1.1.0",
+        "contentHash": "R+0HK6BUMw1B7JC3nDACfmZ+vAjJ75dUF3hGHSJK3ugNyY3QP/HvyMigtXnFW5V1mSg7mKlkUJjQ12pzAIV6rw==",
+        "dependencies": {
+          "YF.Securify.PropertyStore": "1.1.0"
+        }
+      },
+      "Microsoft.Win32.SystemEvents": {
+        "type": "Transitive",
+        "resolved": "9.0.10",
+        "contentHash": "P1CEtsxar/RhfoH3r1vc9ra28LLVYphpcFBxyRIEMM/jP3qh4j9TU4sWH2RUhMZX+GbFxZ+zz1oSP2n9MwjshA=="
+      },
+      "System.Diagnostics.EventLog": {
+        "type": "Transitive",
+        "resolved": "10.0.8",
+        "contentHash": "+Ro7WgIom+BDNH+YhTuZKL6QJ0ctfOpTyfUG/h3aU5KwXt3OaNf0wYWrTvoBUj+34Dy5V8dN9yCco1hAJQ4txw=="
+      },
+      "System.DirectoryServices.Protocols": {
+        "type": "Transitive",
+        "resolved": "9.0.10",
+        "contentHash": "nyJa6GTsPxNYt08Ssl9xHXLyDGozVkmsWgmAegUw9+4TBvS8BO1oV69XlkbyF+oJ6qR4+VPy7lgDWUMapvQfUg=="
+      },
+      "System.Drawing.Common": {
+        "type": "Transitive",
+        "resolved": "9.0.10",
+        "contentHash": "FDakPhIcxHnhslLiz4ZQ+ALpHRpCU3zOep9Mcq+4hL23XwQrzmgJNYvf1tH4kJ/V36wO/ZhRr8nOfiz26P3wKg==",
+        "dependencies": {
+          "Microsoft.Win32.SystemEvents": "9.0.10"
+        }
+      },
+      "YF.Securify.PropertyStore": {
+        "type": "Transitive",
+        "resolved": "1.1.0",
+        "contentHash": "5VX7FOrmA+D854NUvTOyAnwsvB4Y+Of8E/I7/9NJrtyl6ZtGv9vJODSznaRHRMJnn5gpucUs24/Xcd/8EVoaeA=="
+      },
+      "raweb.server.management": {
+        "type": "Project",
+        "dependencies": {
+          "AF.Securify.ShellLink": "[1.1.0, )",
+          "System.DirectoryServices.Protocols": "[9.0.10, )",
+          "System.Drawing.Common": "[9.0.10, )"
+        }
+      }
+    },
+    "net10.0-windows7.0/win-x64": {
+      "Microsoft.DotNet.ILCompiler": {
+        "type": "Direct",
+        "requested": "[10.0.11, )",
+        "resolved": "10.0.11",
+        "contentHash": "yloFUsIQOzspIsn2cDHrbgikKaWHAZspzj0EWxnWJJpFC89IBW64OXgCECsrrnzGWQvy1iLX9r5/R4zBf7Am3g==",
+        "dependencies": {
+          "runtime.win-x64.Microsoft.DotNet.ILCompiler": "10.0.11"
+        }
+      },
+      "System.ServiceProcess.ServiceController": {
+        "type": "Direct",
+        "requested": "[10.0.8, )",
+        "resolved": "10.0.8",
+        "contentHash": "/uCAiixsCUMBsxB7JTjE13RHvDJLq+BVL2toA+ItMMgJ6O07CtljbCoQF2RZ/9jO1RgC35FTGnQo5IAecE4JuQ==",
+        "dependencies": {
+          "System.Diagnostics.EventLog": "10.0.8"
+        }
+      },
+      "Microsoft.Win32.SystemEvents": {
+        "type": "Transitive",
+        "resolved": "9.0.10",
+        "contentHash": "P1CEtsxar/RhfoH3r1vc9ra28LLVYphpcFBxyRIEMM/jP3qh4j9TU4sWH2RUhMZX+GbFxZ+zz1oSP2n9MwjshA=="
+      },
+      "runtime.win-x64.Microsoft.DotNet.ILCompiler": {
+        "type": "Transitive",
+        "resolved": "10.0.11",
+        "contentHash": "D6ZKMo3NeTnos7l5S8bMmiPm4LK+y15Q/uduyPw7FX+xKbeWVWdwlcZGkLLPjLvW4ZO6o3ACanq5HsSXJgrt0g=="
+      },
+      "System.Diagnostics.EventLog": {
+        "type": "Transitive",
+        "resolved": "10.0.8",
+        "contentHash": "+Ro7WgIom+BDNH+YhTuZKL6QJ0ctfOpTyfUG/h3aU5KwXt3OaNf0wYWrTvoBUj+34Dy5V8dN9yCco1hAJQ4txw=="
+      },
+      "System.DirectoryServices.Protocols": {
+        "type": "Transitive",
+        "resolved": "9.0.10",
+        "contentHash": "nyJa6GTsPxNYt08Ssl9xHXLyDGozVkmsWgmAegUw9+4TBvS8BO1oV69XlkbyF+oJ6qR4+VPy7lgDWUMapvQfUg=="
+      }
+    }
+  }
+}

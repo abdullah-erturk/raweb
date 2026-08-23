@@ -1,0 +1,865 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Security.Principal;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Win32;
+using RAWeb.Server.Management;
+
+namespace RAWeb.Server.Utilities;
+
+/// <summary>
+/// A builder class for constructing a MS-TSWP-compliant workspace
+/// XML string that represents a collection of Remote Desktop resources.
+/// </summary>
+public class WorkspaceBuilder {
+    public enum SchemaVersion {
+        v1_1 = 1,
+        v2 = 2,
+        v2_1 = 3
+    }
+
+    private readonly AliasResolver _resolver = new();
+
+    private readonly UserInformation? _authenticatedUserInfo = null;
+    private readonly bool _mergeTerminalServers = false;
+    private readonly string? _terminalServerFilter = null;
+
+    private readonly double _schemaVersion = 1.0;
+    private readonly string _iisBase;
+
+    private readonly IManagementServiceDirectClient? _managedResourceService = null;
+
+    private StringBuilder _resourcesBuffer = new();
+    private readonly Dictionary<string, DateTime> _terminalServerTimestamps = new Dictionary<string, DateTime>();
+
+    // keep track of previous resource GUIDs to avoid duplicates
+    string[] _previousResourceGUIDs = [];
+
+    readonly string _fullyQualifiedDomainName = "";
+
+    /// <summary>
+    /// Initializes a new instance of the <c>WorkspaceBuilder</c> class.
+    /// </summary>
+    /// <param name="version">The version of the MS-TWSP.</param>
+    /// <param name="authenticatedUserInfo"></param>
+    /// <param name="fullyQualifiedDomainName">The fully qualified domain name, used for the ID in the workspace XML. See HttpContext.Current.Request.Url.Host.</param>
+    /// <param name="mergeTerminalServers">Whether identical resources across multiple terminal servers are provided as a single resource with mnultiple terminal servers. When this option is false, each resource is listed separately even though the resources are the same.</param>
+    /// <param name="terminalServerFilter">Filter the resources to the specified terminal server.</param>
+    /// <param name="iisBase">The IIS base path, e.g., VirtualPathUtility.ToAbsolute("~/")</param>
+    /// <param name="managedResourceService">An implementation of IManagedResourceService.</param>
+    /// <exception cref="ArgumentException"></exception>
+    public WorkspaceBuilder(SchemaVersion version, UserInformation authenticatedUserInfo, string fullyQualifiedDomainName, bool mergeTerminalServers = false, string? terminalServerFilter = null, string iisBase = "/",
+        IManagementServiceDirectClient? managedResourceService = null) {
+        if (version == SchemaVersion.v1_1) {
+            _schemaVersion = 1.1;
+        }
+        else if (version == SchemaVersion.v2) {
+            _schemaVersion = 2.0;
+        }
+        else if (version == SchemaVersion.v2_1) {
+            _schemaVersion = 2.1;
+        }
+        else {
+            throw new ArgumentException("Unsupported workspace version: " + version.ToString());
+        }
+
+        _authenticatedUserInfo = authenticatedUserInfo;
+        _fullyQualifiedDomainName = fullyQualifiedDomainName;
+        _mergeTerminalServers = mergeTerminalServers;
+        _terminalServerFilter = string.IsNullOrEmpty(terminalServerFilter) ? null : terminalServerFilter;
+        _iisBase = iisBase;
+        _managedResourceService = managedResourceService;
+    }
+
+    /// <summary>
+    /// Processes the resources and generates the workspace XML as a string.
+    /// </summary>
+    /// <param name="resourcesFolder">The folder to use when searching for RDP files. This can be a relative path (e.g., "resources") or an absolute path (e.g., "C:\inetpub\wwwroot\App_Data\resources").</param>
+    /// <param name="multiuserResourcesFolder">The folder to use when searching for multiuser RDP files. This can be a relative path (e.g., "multiuser-resources") or an absolute path (e.g., "C:\inetpub\wwwroot\App_Data\multiuser-resources").</param>
+    /// <returns></returns>
+    public string GetWorkspaceXmlString(string resourcesFolder = "resources", string multiuserResourcesFolder = "multiuser-resources", string managedResourcesFolder = "managed-resources", HttpContext? httpContext = null) {
+        var serverName = _terminalServerFilter ?? Environment.MachineName;
+        var datetime = $"{DateTime.UtcNow:yyyy-MM-ddTHH:mm:ss}Z";
+
+        var debug = PoliciesManager.RawPolicies["Workspace.DebugMode"] == "true";
+        if (debug == true) {
+            // write JSON-encoded comments
+            var authUserJson = JsonSerializer.Serialize(_authenticatedUserInfo, WorkspaceDebugJsonContext.Default.UserInformation);
+            _resourcesBuffer.Append($"<!-- Authenticated User Information: {authUserJson.Replace("--", "==")} -->\r\n");
+
+            var policiesJson = JsonSerializer.Serialize(PoliciesManager.RawPolicies.Value, WorkspaceDebugJsonContext.Default.DictionaryStringString);
+            _resourcesBuffer.Append($"<!-- Current Policies: {policiesJson.Replace("--", "==")} -->\r\n");
+
+            var supportsCentralizedPublishing = PoliciesManager.RawPolicies["RegistryApps.Enabled"] != "true";
+            var centralizedPublishingCollectionName = AppId.ToCollectionName();
+            var systemRemoteApps = new SystemRemoteApps(supportsCentralizedPublishing ? centralizedPublishingCollectionName : null);
+            var managedSystemRemoreApps = systemRemoteApps.GetAllRegisteredApps(restorePackagedAppIconPaths: false);
+            var managedSraJson = JsonSerializer.Serialize(managedSystemRemoreApps, WorkspaceDebugJsonContext.Default.SystemRemoteAppCollection);
+            _resourcesBuffer.Append($"<!-- Managed System Remote Apps: {managedSraJson.Replace("--", "==")} -->\r\n");
+
+            var desktopResource = SystemDesktop.FromRegistry(centralizedPublishingCollectionName, centralizedPublishingCollectionName);
+            var systemDesktopJson = JsonSerializer.Serialize(desktopResource, WorkspaceDebugJsonContext.Default.SystemDesktop);
+            _resourcesBuffer.Append($"<!-- System Desktop Resource: {systemDesktopJson.Replace("--", "==")} -->\r\n");
+
+            var managedFileResources = ManagedFileResources.FromDirectory(Path.Combine(Constants.AppDataFolderPath, managedResourcesFolder));
+            var managedFileResourcesJson = JsonSerializer.Serialize(managedFileResources, WorkspaceDebugJsonContext.Default.ManagedFileResources);
+            _resourcesBuffer.Append($"<!-- Managed File Resources: {managedFileResourcesJson.Replace("--", "==")} -->\r\n");
+        }
+
+        var supportsTerminalServerConnections = false;
+        try {
+            supportsTerminalServerConnections = _managedResourceService?.AreConnectionsAllowed() ?? false;
+        }
+        catch (Exception ex) when (ex is not EndpointNotFoundException) {
+        }
+
+        // process resources
+        if (supportsTerminalServerConnections) {
+            ProcessRegistryResources(httpContext);
+        }
+        ProcessResources(resourcesFolder);
+        ProcessMultiuserResources(multiuserResourcesFolder);
+        ProcessManagedResources(managedResourcesFolder);
+
+        // calculate publisher details
+        var resolver = new AliasResolver();
+        var publisherName = resolver.Resolve(serverName);
+        var publisherDateTime = DateTime.MinValue;
+        foreach (var terminalServer in _terminalServerTimestamps.Keys) {
+            var serverTimestamp = _terminalServerTimestamps[terminalServer];
+            if (serverTimestamp > publisherDateTime) {
+                publisherDateTime = serverTimestamp;
+            }
+        }
+        var publisherTimestamp = $"{publisherDateTime:yyyy-MM-ddTHH:mm:ss}Z";
+
+        // construct the final XML string
+        var workspaceXml = new StringBuilder();
+        workspaceXml.Append($"<ResourceCollection PubDate=\"{datetime}\" SchemaVersion=\"{_schemaVersion}\" {(_schemaVersion >= 2.0 ? "SupportsReconnect=\"false\" " : "")}xmlns=\"http://schemas.microsoft.com/ts/2007/05/tswf\">\r\n");
+        workspaceXml.Append($"<Publisher LastUpdated=\"{publisherTimestamp}\" Name=\"{publisherName}\" ID=\"{_fullyQualifiedDomainName}\" Description=\"\">\r\n");
+
+        workspaceXml.Append("<Resources>\r\n");
+        var resourcesXML = _resourcesBuffer.ToString();
+        resourcesXML = Regex.Replace(resourcesXML, @"<FolderInjectionPoint.*?/>", "");
+        resourcesXML = Regex.Replace(resourcesXML, @"<TerminalServerInjectionPoint.*?/>", "");
+        workspaceXml.Append(resourcesXML);
+        workspaceXml.Append("</Resources>\r\n");
+
+        workspaceXml.Append("<TerminalServers>\r\n");
+        foreach (var terminalServer in _terminalServerTimestamps.Keys) {
+            var terminalServerName = terminalServer;
+            var terminalServerTimestamp = $"{_terminalServerTimestamps[terminalServer]:yyyy-MM-ddTHH:mm:ss}Z";
+            workspaceXml.Append($"<TerminalServer ID=\"{terminalServerName}\" LastUpdated=\"{terminalServerTimestamp}\" />\r\n");
+        }
+        workspaceXml.Append("</TerminalServers>\r\n");
+
+        workspaceXml.Append("</Publisher>\r\n");
+        workspaceXml.Append("</ResourceCollection>" + "\r\n");
+
+        return workspaceXml.ToString();
+    }
+
+    private void ProcessResource(Resource resource) {
+        // skip resources that do not match the terminal server
+        if (!string.IsNullOrEmpty(_terminalServerFilter) && resource.FullAddress != _terminalServerFilter) {
+            return;
+        }
+
+        var libAssetsPath = "resource://static/lib/assets";
+
+        var resourceTimestamp = $"{resource.LastUpdated:yyyy-MM-ddTHH:mm:ss}Z";
+
+        // add the timestamp to the terminal server timestamps if it is the latest one
+        if (!_terminalServerTimestamps.ContainsKey(resource.FullAddress) || resource.LastUpdated > _terminalServerTimestamps[resource.FullAddress]) {
+            _terminalServerTimestamps[resource.FullAddress] = resource.LastUpdated;
+        }
+
+        // elements to use to create an injection point element for the folder element
+        // that we can use to inject additional folders later
+        var injectionPointElement = "<FolderInjectionPoint guid=\"" + resource.Id + "\"/>";
+        var folderNameElements = resource.VirtualFolders.Select(virtualFolder => "<Folder Name=\"" + (virtualFolder == "" ? "/" : virtualFolder) + "\" />" + "\r\n");
+
+        //
+        var apiResourcePath = resource.RelativePath;
+
+        // build the query string for the resource file URL: 'from' tells the resource
+        // endpoint where to look for the resource, and 'features' advertises optional
+        // capabilities of the resource so that clients know what they can offer for it
+        var queryParameters = new List<string>();
+        switch (resource.Origin) {
+            case ResourceOrigin.Registry:
+                queryParameters.Add("from=registry");
+                break;
+            case ResourceOrigin.RegistryDesktop:
+                queryParameters.Add("from=registryDesktop");
+                break;
+            case ResourceOrigin.ManagedResource:
+                queryParameters.Add("from=mr");
+                break;
+        }
+        if (resource.SupportsWake) {
+            queryParameters.Add("features=supportsWake");
+        }
+        // the separator must be an escaped ampersand because this URL is written into an
+        // XML attribute, where a bare "&" starts an entity reference and is not well-formed
+        var resourceFileQuery = queryParameters.Count > 0 ? "?" + string.Join("&amp;", queryParameters) : "";
+
+        var tsInjectionPointElement = "<TerminalServerInjectionPoint guid=\"" + resource.Id + "\"/>";
+        var tsElement = "<TerminalServerRef Ref=\"" + resource.FullAddress + "\" />" + "\r\n";
+        var tsElements = "<HostingTerminalServer>" + "\r\n" +
+            "<ResourceFile FileExtension=\".rdp\" URL=\"" + _iisBase + "api/resources/" + apiResourcePath + resourceFileQuery + "\" />" + "\r\n" +
+            tsElement +
+            "</HostingTerminalServer>" + "\r\n";
+
+        // if a  resource with the same ID already exists, use special logic to make it appear in multiple
+        // folders and/or terminal server listings instead of adding a duplicate resource
+        if (Array.IndexOf(_previousResourceGUIDs, resource.Id) >= 0) {
+            var existingResources = _resourcesBuffer.ToString();
+
+            if (_schemaVersion >= 2.0) {
+                var injectionPointIndex = existingResources.IndexOf(injectionPointElement);
+                var frontTruncatedResources = existingResources.Substring(injectionPointIndex);
+                var firstFoldersElemEndIndex = frontTruncatedResources.IndexOf("</Folders>");
+                var currentFoldersElements = frontTruncatedResources.Substring(0, firstFoldersElemEndIndex);
+
+                // ensure that each folder is not already in the list of folders for this resource
+                foreach (var folderNameElement in folderNameElements) {
+                    var folderAlreadyExists = currentFoldersElements.Contains(folderNameElement.Trim());
+
+                    if (!folderAlreadyExists) {
+                        // insert this folder element in front of the injection point element
+                        _resourcesBuffer = _resourcesBuffer.Replace(injectionPointElement, injectionPointElement + folderNameElement);
+                    }
+                }
+
+            }
+
+            if (_mergeTerminalServers) {
+                // ensure that the terminal server is not already in the list of terminal servers for this resource
+                var tsInjectionPointIndex = existingResources.IndexOf(tsInjectionPointElement);
+                var tsFrontTruncatedResources = existingResources.Substring(tsInjectionPointIndex);
+                var firstTerminalServerElemEndIndex = tsFrontTruncatedResources.IndexOf("</HostingTerminalServers>");
+                var currentTerminalServerElements = tsFrontTruncatedResources.Substring(0, firstTerminalServerElemEndIndex);
+                var terminalServerAlreadyExists = currentTerminalServerElements.Contains(tsElement.Trim());
+
+                if (!terminalServerAlreadyExists) {
+                    // insert this terminal server element in front of the injection point element
+                    _resourcesBuffer = _resourcesBuffer.Replace(tsInjectionPointElement, tsInjectionPointElement + tsElements);
+                }
+            }
+
+            return;
+        }
+
+        // construct the resource element
+        _resourcesBuffer.Append("<Resource ID=\"" + resource.Id + "\" Alias=\"" + resource.Alias + "\" Title=\"" + resource.Title + "\" LastUpdated=\"" + resourceTimestamp + "\" Type=\"" + resource.Type + "\"" + (_schemaVersion >= 2.1 ? " ShowByDefault=\"True\"" : "") + ">" + "\r\n");
+        _resourcesBuffer.Append("<Icons>" + "\r\n");
+        _resourcesBuffer.Append(ConstructIconElements(_authenticatedUserInfo, (resource.Origin == ResourceOrigin.Registry ? "registry!" : resource.Origin == ResourceOrigin.RegistryDesktop ? "registryDesktop!" : "") + resource.RelativePath.Replace(".rdp", "").Replace(".resource", ""), resource.IsDesktop ? IconElementsMode.Wallpaper : IconElementsMode.Icon, resource.IsDesktop ? (libAssetsPath + "/wallpaper.png") : (libAssetsPath + "/default.ico")));
+        _resourcesBuffer.Append("</Icons>" + "\r\n");
+        if (resource.FileExtensions is not null && resource.FileExtensions.Length > 0) {
+            _resourcesBuffer.Append("<FileExtensions>" + "\r\n");
+            foreach (var fileExt in resource.FileExtensions) {
+                if (_schemaVersion >= 2.0) {
+                    _resourcesBuffer.Append("<FileExtension Name=\"" + fileExt + "\" PrimaryHandler=\"True\">" + "\r\n");
+                }
+                else {
+                    _resourcesBuffer.Append("<FileExtension Name=\"" + fileExt + "\" >" + "\r\n");
+                }
+
+                if (_schemaVersion >= 2.0) {
+                    // if the icon exists, add it to the resource
+                    var maybeIconElements = ConstructIconElements(_authenticatedUserInfo, (resource.Origin == ResourceOrigin.Registry ? ("registry!" + fileExt.Replace(".", "") + ":") : "") + resource.RelativePath.Replace(".rdp", resource.Origin == ResourceOrigin.Registry ? "" : fileExt).Replace(".resource", "!" + fileExt), resource.IsDesktop ? IconElementsMode.Wallpaper : IconElementsMode.Icon, resource.IsDesktop ? (libAssetsPath + "/wallpaper.png") : (libAssetsPath + "/default.ico"), skipMissing: true);
+                    if (!string.IsNullOrEmpty(maybeIconElements)) {
+                        _resourcesBuffer.Append("<FileAssociationIcons>" + "\r\n");
+                        _resourcesBuffer.Append(maybeIconElements);
+                        _resourcesBuffer.Append("</FileAssociationIcons>" + "\r\n");
+                    }
+                }
+
+                _resourcesBuffer.Append("</FileExtension>" + "\r\n");
+            }
+            _resourcesBuffer.Append("</FileExtensions>" + "\r\n");
+        }
+        else {
+            _resourcesBuffer.Append("<FileExtensions />" + "\r\n");
+        }
+        if (_schemaVersion >= 2.0) {
+            _resourcesBuffer.Append("<Folders>" + "\r\n");
+            _resourcesBuffer.Append(injectionPointElement);
+            _resourcesBuffer.Append(string.Join("", folderNameElements));
+            _resourcesBuffer.Append("</Folders>" + "\r\n");
+        }
+        _resourcesBuffer.Append("<HostingTerminalServers>" + "\r\n");
+        _resourcesBuffer.Append(tsInjectionPointElement);
+        _resourcesBuffer.Append(tsElements);
+        _resourcesBuffer.Append("</HostingTerminalServers>" + "\r\n");
+        _resourcesBuffer.Append("</Resource>" + "\r\n");
+
+        // add the resource ID to the list of previous resource GUIDs to avoid duplicates
+        Array.Resize(ref _previousResourceGUIDs, _previousResourceGUIDs.Length + 1);
+        if (resource.Id is not null) {
+            _previousResourceGUIDs[_previousResourceGUIDs.Length - 1] = resource.Id;
+        }
+        else {
+            // since we call CalculateGuid() when creating the resource, this should never happen.
+            throw new Exception("Resource ID is null.");
+        }
+    }
+
+    private void ProcessRegistryResources(HttpContext? httpContext = null) {
+        var supportsCentralizedPublishing = PoliciesManager.RawPolicies["RegistryApps.Enabled"] != "true";
+        var centralizedPublishingCollectionName = AppId.ToCollectionName();
+        var remoteApps = new SystemRemoteApps(supportsCentralizedPublishing ? centralizedPublishingCollectionName : null);
+
+        // get the registered registry-managed resources
+        SystemRemoteApps.SystemRemoteAppCollection managedAppResources;
+        try {
+            managedAppResources = remoteApps.GetAllRegisteredApps(restorePackagedAppIconPaths: true);
+        }
+        catch (UnauthorizedAccessException) {
+            if (_managedResourceService is null) {
+                throw;
+            }
+
+            // UnauthorizedAccessException means that either the registry paths are missing or an icon path needs to be restored
+            _managedResourceService.InitializeRegistryPaths(supportsCentralizedPublishing ? centralizedPublishingCollectionName : null);
+            if (supportsCentralizedPublishing && !string.IsNullOrEmpty(centralizedPublishingCollectionName)) {
+                _managedResourceService.InitializeDesktopRegistryPaths(centralizedPublishingCollectionName);
+            }
+            _managedResourceService.RestorePackagedAppIconPaths(supportsCentralizedPublishing ? centralizedPublishingCollectionName : null);
+            managedAppResources = remoteApps.GetAllRegisteredApps(restorePackagedAppIconPaths: false);
+        }
+        catch (Exception ex) when (ex is not EndpointNotFoundException) {
+            managedAppResources = [];
+        }
+
+        // process each resource
+        foreach (var managedResource in managedAppResources) {
+            if (!managedResource.IncludeInWorkspace) {
+                continue; // skip if the resource is not allowed to be shown in the webfeed/workspace
+            }
+
+            // require that RemoteAppProperties is set
+            if (managedResource.RemoteAppProperties == null) {
+                continue;
+            }
+
+            if (string.IsNullOrEmpty(managedResource.RemoteAppProperties.ApplicationPath)) {
+                continue; // skip if the application path is missing
+            }
+
+            var hasPermission = _authenticatedUserInfo is not null && RegistryReader.CanAccessRemoteApp(managedResource.Identifier, _authenticatedUserInfo);
+            if (!hasPermission) {
+                continue; // skip if the user does not have permission to access the application
+            }
+
+            // calculate the file extensions supported by the application
+            var appFileExtCSV = managedResource.RemoteAppProperties.FileTypeAssociations
+                .Select(fta => fta.Extension.ToLowerInvariant())
+                .Aggregate("", (current, ext) => current + (current.Length == 0 ? ext : $",{ext}"));
+
+            // get the generated rdp file
+            var rdpFileContents = RegistryReader.ConstructRdpFileFromRegistry(managedResource.Identifier, httpContext: httpContext);
+
+            var publisherName = _resolver.Resolve(Environment.MachineName);
+
+            // create a resource from the registry entry
+            var resource = new Resource(
+                title: managedResource.Name,
+                fullAddress: publisherName,
+                appProgram: managedResource.RemoteAppProperties.ApplicationPath,
+                alias: "registry/" + managedResource.Identifier,
+                appFileExtCSV: appFileExtCSV,
+                lastUpdated: managedResource.GetLastWriteTimeUtcOrDefault(),
+                virtualFolders: managedResource.VirtualFolders,
+                origin: ResourceOrigin.Registry,
+                source: managedResource.Identifier
+            ).CalculateGuid(rdpFileContents, _schemaVersion, _mergeTerminalServers);
+
+            ProcessResource(resource);
+        }
+
+        // get the desktop resource
+        if (supportsCentralizedPublishing) {
+            var desktopResource = SystemDesktop.FromRegistry(centralizedPublishingCollectionName, centralizedPublishingCollectionName);
+
+            if (desktopResource is not null && desktopResource.IncludeInWorkspace) {
+                var registryKey = Registry.LocalMachine.OpenSubKey(desktopResource.collectionDesktopsRegistryPath + "\\" + centralizedPublishingCollectionName);
+                if (registryKey is null) {
+                    return; // skip if the registry key does not exist
+                }
+                var hasPermission = _authenticatedUserInfo is not null && RegistryReader.CanAccessRemoteApp(registryKey, _authenticatedUserInfo);
+                if (hasPermission) {
+                    // get the generated rdp file
+                    var rdpFileContents = RegistryReader.ConstructRdpFileFromRegistry(centralizedPublishingCollectionName, isDesktop: true, httpContext: httpContext);
+
+                    var publisherName = _resolver.Resolve(Environment.MachineName);
+
+                    // create a resource from the registry entry
+                    var resource = new Resource(
+                        title: desktopResource.Name,
+                        fullAddress: publisherName,
+                        appProgram: null,
+                        alias: "registry/desktop/" + centralizedPublishingCollectionName,
+                        appFileExtCSV: "",
+                        lastUpdated: desktopResource.GetLastWriteTimeUtcOrDefault(),
+                        virtualFolders: desktopResource.VirtualFolders,
+                        origin: ResourceOrigin.RegistryDesktop,
+                        source: centralizedPublishingCollectionName
+                    ).CalculateGuid(rdpFileContents, _schemaVersion, _mergeTerminalServers);
+
+                    ProcessResource(resource);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Processes the resources in the specified directory and its subdirectors and adds them to the resources buffer.
+    /// <br/>
+    /// This method will recursively search for RDP files in the directory and its subdirectories.
+    /// </summary>
+    /// <param name="directoryPath">The directory to use when searching for RDP files.</param>
+    /// <param name="virtualFolder">Provide a the resource's virtual folder in the webfeed. Virtual folders should start with a forward slash (/) and NOT end with a forward slash (/). If not provided, the root virtual folder will be used.</param>
+    private void ProcessResources(string directoryPath, string virtualFolder = "") {
+        // convert directoryPath to a physical path if it is a relative path
+        var root = Constants.AppDataFolderPath;
+        var isRooted = Path.IsPathRooted(directoryPath);
+        directoryPath = isRooted ? directoryPath : Path.Combine(root, directoryPath);
+
+        if (!Directory.Exists(directoryPath)) {
+            return; // skip if the directory does not exist
+        }
+
+        var subDirectories = Directory.GetDirectories(directoryPath);
+        foreach (var subDirectory in subDirectories) {
+            var subVirtualFolder = virtualFolder + "/" + Path.GetFileName(subDirectory);
+            ProcessResources(subDirectory, subVirtualFolder);
+        }
+
+        var directoryRdpFilePaths = Directory.GetFiles(directoryPath, "*.rdp");
+        foreach (var rdpFilePath in directoryRdpFilePaths) {
+            try {
+                var hasPermission = _authenticatedUserInfo is not null && FileAccessInfo.CanAccessPath(rdpFilePath, _authenticatedUserInfo);
+                if (!hasPermission) {
+                    continue; // skip if the user does not have permission to access the rdp file
+                }
+
+                // prepare the info for the resource
+                var resource = Resource
+                    .FromRdpFile(rdpFilePath, virtualFolder)
+                    .CalculateGuid(_schemaVersion, _mergeTerminalServers);
+
+                // process the resource
+                ProcessResource(resource);
+            }
+            catch (Resource.FullAddressMissingException) {
+                continue; // skip if the RDP file does not have a full address
+            }
+
+        }
+    }
+
+    private void ProcessMultiuserResources(string directoryPath) {
+        // convert directoryPath to a physical path if it is a relative path
+        var root = Constants.AppDataFolderPath;
+        var isRooted = Path.IsPathRooted(directoryPath);
+        directoryPath = isRooted ? directoryPath : Path.Combine(root, directoryPath);
+
+        var showGroupAndUserNames = PoliciesManager.RawPolicies["Workspace.ShowMultiuserResourcesUserAndGroupNames"] != "false";
+
+        if (_authenticatedUserInfo is null) {
+            return; // skip if the user is not authenticated
+        }
+
+        // process resources in basePath\\user\\ [username]
+        var userFolder = directoryPath + "\\user\\" + _authenticatedUserInfo.Username + "\\";
+        if (Directory.Exists(userFolder)) {
+            var virtualFolder = showGroupAndUserNames ? "/" + _authenticatedUserInfo.FullName : "";
+            ProcessResources(userFolder, virtualFolder);
+        }
+
+        // process resources in basePath\\group\\ [group name]
+        // and basePath\\group\\ [group SID]
+        foreach (var group in _authenticatedUserInfo.Groups) {
+            var virtualFolder = showGroupAndUserNames ? "/" + group.Name : "";
+
+            var GroupNameFolder = directoryPath + "\\group\\" + group.Name + "\\";
+            if (Directory.Exists(GroupNameFolder)) {
+                ProcessResources(GroupNameFolder, virtualFolder);
+            }
+
+            var GroupSidFolder = directoryPath + "\\group\\" + group.Sid + "\\";
+            if (Directory.Exists(GroupSidFolder)) {
+                ProcessResources(GroupSidFolder, virtualFolder);
+            }
+        }
+    }
+
+    private void ProcessManagedResources(string directoryPath) {
+        // convert directoryPath to a physical path if it is a relative path
+        var root = Constants.AppDataFolderPath;
+        var isRooted = Path.IsPathRooted(directoryPath);
+        directoryPath = isRooted ? directoryPath : Path.Combine(root, directoryPath);
+
+        if (_authenticatedUserInfo is null) {
+            return; // skip if the user is not authenticated
+        }
+
+        // process all managed resources in the directory
+        var managedResources = ManagedFileResources.FromDirectory(directoryPath);
+        foreach (var managedResource in managedResources) {
+            var hasPermission = managedResource.SecurityDescriptor == null ||
+                managedResource.SecurityDescriptor.GetAllowedSids().Any(sid => _authenticatedUserInfo.Sid == sid.ToString() || _authenticatedUserInfo.Groups.Any(g => g.Sid == sid.ToString()));
+            if (!hasPermission) {
+                continue; // skip if the user does not have permission to access the resource
+            }
+
+            if (managedResource.RdpFileString == null || string.IsNullOrEmpty(managedResource.RdpFileString)) {
+                continue; // skip if the RDP file string is missing
+            }
+
+            if (managedResource.IncludeInWorkspace != true) {
+                continue; // skip if the resource is not configured to be included in the workspace
+            }
+
+            var relativeFilePath = managedResource.RootedFilePath.Replace(root + Path.DirectorySeparatorChar, "").Replace("\\", "/");
+
+            // ensure that there is a full address in the RDP file
+            var fullAddress = Resource.Utilities.GetRdpStringProperty(managedResource.RdpFileString, "full address:s:");
+            if (string.IsNullOrEmpty(fullAddress)) {
+                throw new Resource.FullAddressMissingException();
+            }
+
+            // build the resource
+            var resource = new Resource(
+                title: Resource.Utilities.GetRdpStringProperty(managedResource.RdpFileString, "remoteapplicationname:s:", managedResource.Name),
+                fullAddress: Resource.Utilities.GetRdpStringProperty(managedResource.RdpFileString, "full address:s:"),
+                appProgram: managedResource.RemoteAppProperties?.ApplicationPath ?? Resource.Utilities.GetRdpStringProperty(managedResource.RdpFileString, "remoteapplicationprogram:s:").Replace("|", ""),
+                alias: relativeFilePath,
+                appFileExtCSV: Resource.Utilities.GetRdpStringProperty(managedResource.RdpFileString, "remoteapplicationfileextensions:s:"),
+                lastUpdated: managedResource.GetLastWriteTimeUtcOrDefault(),
+                virtualFolders: managedResource.VirtualFolders,
+                origin: ResourceOrigin.ManagedResource,
+                source: managedResource.RootedFilePath
+            ) {
+                // a managed resource can only be woken when an administrator has
+                // configured the MAC address of the device's network adapter
+                SupportsWake = !string.IsNullOrWhiteSpace(managedResource.MacAddress)
+            }.CalculateGuid(managedResource.RdpFileString, _schemaVersion, _mergeTerminalServers);
+
+            // process the resource
+            ProcessResource(resource);
+        }
+    }
+
+    public enum IconElementsMode {
+        Icon,
+        Wallpaper
+    }
+
+    /// <summary>
+    /// Constructs XML elements for icons of various sizes based on the provided icon path and mode.
+    /// It checks for the existence and accessibility of the icon file, and falls back to a
+    /// default icon if necessary.
+    /// </summary>
+    /// <param name="authenticatedUserInfo"></param>
+    /// <param name="relativeExtenesionlessIconPath">The path to the icon file. THe path should not include the file extension for the icon. The path should be relative to the App_Data folder.</param>
+    /// <param name="mode"></param>
+    /// <param name="relativeDefaultIconPath">The path to the default icon, relative to the App_Data folder. Unlke <c>relativeExtenesionlessIconPath</c>, this value should include the icon extension.</param>
+    /// <param name="skipMissing">When <c>true</c>, the returned value of this method will be an empty string. Otherwise, the default icon will be used to generate the XML string instead.</param>
+    /// <returns></returns>
+    public string ConstructIconElements(
+      UserInformation? authenticatedUserInfo,
+      string relativeExtenesionlessIconPath,
+      IconElementsMode mode,
+      string relativeDefaultIconPath = "resource://static/lib/assets/default.ico",
+      bool skipMissing = false
+    ) {
+        if (authenticatedUserInfo is null) {
+            return "";
+        }
+
+        // get the RAWeb.Server assembly, which contains the resources referenced by resource://static/lib/assets/...
+        var serverAssembly = Constants.ServerResourceAssembly;
+
+        var appDataRoot = Constants.AppDataFolderPath;
+        var defaultIconPath = relativeDefaultIconPath.StartsWith("resource://") ? relativeDefaultIconPath : Path.Combine(appDataRoot, relativeDefaultIconPath);
+
+        var iconPath = Path.Combine(appDataRoot, string.Format("{0}", relativeExtenesionlessIconPath));
+
+        // create placeholders for tracking the icon dimensions
+        var iconWidth = 0;
+        var iconHeight = 0;
+
+        try {
+            // if the icon is from the registry, we get the dimensions from there
+            if (relativeExtenesionlessIconPath.StartsWith("registry!")) {
+                var appKeyName = relativeExtenesionlessIconPath.Split('!').LastOrDefault();
+                var maybeFileExtName = relativeExtenesionlessIconPath.Split('!')[1];
+                if (maybeFileExtName == appKeyName) {
+                    maybeFileExtName = "";
+                }
+
+                if (appKeyName is null) {
+                    // if the app key name is null, use the default icon
+                    throw new Exception();
+                }
+                else {
+                    Stream? fileStream = RegistryReader.ReadImageFromRegistry(appKeyName, maybeFileExtName, authenticatedUserInfo);
+                    if (fileStream == null) {
+                        // if the file stream is null, use the default icon
+                        throw new Exception();
+                    }
+
+                    using (var image = System.Drawing.Image.FromStream(fileStream, false, false)) {
+                        iconWidth = image.Width;
+                        iconHeight = image.Height;
+                    }
+                }
+            }
+
+            // if the icon is from a desktop stored in the registry, resolve the icon from there
+            else if (relativeExtenesionlessIconPath.StartsWith("registryDesktop!")) {
+                var appKeyName = relativeExtenesionlessIconPath.Split('!').LastOrDefault();
+
+                if (appKeyName is null) {
+                    // if the app key name is null, use the default icon
+                    throw new Exception();
+                }
+
+                // require centralized publishing to be enabled
+                var supportsCentralizedPublishing = PoliciesManager.RawPolicies["RegistryApps.Enabled"] != "true";
+                var centralizedPublishingCollectionName = AppId.ToCollectionName();
+                if (!supportsCentralizedPublishing) {
+                    throw new Exception("Centralized Publishing is not enabled on this server.");
+                }
+
+                // find the desktop resource
+                var resource = SystemDesktop.FromRegistry(centralizedPublishingCollectionName, appKeyName);
+                if (resource is null) {
+                    throw new Exception();
+                }
+
+                // get the wallpaper as a stream
+                var userSid = _authenticatedUserInfo is null ? null : new SecurityIdentifier(_authenticatedUserInfo.Sid);
+                Stream wallpaperStream;
+                if (_managedResourceService is not null) {
+                    wallpaperStream = _managedResourceService.GetWallpaperStream(resource, ManagedFileResource.ImageTheme.Light, userSid?.Value);
+                }
+                else {
+                    wallpaperStream = resource.GetWallpaperStream(ManagedFileResource.ImageTheme.Light, userSid);
+                }
+
+                // get the icon dimensions
+                using (var image = System.Drawing.Image.FromStream(wallpaperStream, false, false)) {
+                    iconWidth = image.Width;
+                    iconHeight = image.Height;
+                }
+            }
+
+            // if the icon is from a managed resource, we need to read the icon dimensions from there
+            else if (relativeExtenesionlessIconPath.StartsWith("managed-resources/")) {
+
+                var parts = relativeExtenesionlessIconPath.Split(['/', '!']);
+
+                var managedResourceIdentifier = parts.Length > 0 ? parts[1] : null;
+                var maybeIconIndentifier = parts.Length == 3 ? parts[2] : null;
+                if (managedResourceIdentifier is null) {
+                    throw new Exception();
+                }
+
+                // construct the managed resource path
+                var rootedManagedResourcePath = Path.Combine(Constants.ManagedResourcesFolderPath, managedResourceIdentifier + ".resource");
+
+                // check whether the user has access to the managed resource file
+                var hasPermission = FileAccessInfo.CanAccessPath(rootedManagedResourcePath, authenticatedUserInfo);
+                if (!hasPermission) {
+                    throw new Exception();
+                }
+
+                // get the icon dimensions
+                var managedResource = ManagedFileResource.FromResourceFile(rootedManagedResourcePath);
+                using (var fileStream = managedResource.ReadImageStream(out _, ManagedFileResource.ImageTheme.Light, maybeIconIndentifier)) {
+                    using (var image = System.Drawing.Image.FromStream(fileStream, false, false)) {
+                        iconWidth = image.Width;
+                        iconHeight = image.Height;
+                    }
+                }
+            }
+
+            // if the icon is a resource embedded in the assembly, we need to extract it from there
+            else if (relativeExtenesionlessIconPath.StartsWith("resource://static/lib/assets/")) {
+                if (serverAssembly is null) {
+                    throw new Exception("Could not find the server assembly to load the embedded resource.");
+                }
+
+                var resourceName = relativeExtenesionlessIconPath.Replace("resource://", "");
+
+                using (var resourceStream = serverAssembly.GetManifestResourceStream(resourceName)) {
+                    if (resourceStream is null) {
+                        throw new Exception();
+                    }
+
+                    using (var image = System.Drawing.Image.FromStream(resourceStream, false, false)) {
+                        iconWidth = image.Width;
+                        iconHeight = image.Height;
+                    }
+                }
+            }
+
+            // otherwise, get the icon dimensions from the file
+            else {
+                // get the icon path, preferring the png icon first, then the ico icon, and finally the default icon
+                if (File.Exists(iconPath + ".png")) {
+                    iconPath += ".png";
+                }
+                else if (File.Exists(iconPath + ".ico")) {
+                    iconPath += ".ico";
+                }
+                else {
+                    throw new Exception(iconPath);
+                    // if the user does not have permission to access the icon file, use the default icon
+                    throw new Exception();
+                }
+
+                // confirm that the current user has permission to access the icon file
+                var hasPermission = FileAccessInfo.CanAccessPath(iconPath, authenticatedUserInfo);
+                if (!hasPermission) {
+                    throw new Exception();
+                }
+
+                // get the icon dimensions
+                using (var fileStream = new FileStream(iconPath, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+                    using (var image = System.Drawing.Image.FromStream(fileStream, false, false)) {
+                        iconWidth = image.Width;
+                        iconHeight = image.Height;
+                    }
+                }
+            }
+        }
+        catch (Exception ex) when (ex is not EndpointNotFoundException) {
+            if (skipMissing) {
+                return "";
+            }
+
+            // since we could not access the icon, use the default icon
+#pragma warning disable IDE0059 // Unnecessary assignment of a value
+            iconPath = defaultIconPath;
+#pragma warning restore IDE0059 // Unnecessary assignment of a value
+            relativeExtenesionlessIconPath = relativeDefaultIconPath;
+
+            // get the default icon dimensions
+            if (relativeDefaultIconPath.StartsWith("resource://")) {
+                if (serverAssembly != null) {
+                    using (var resourceStream = serverAssembly.GetManifestResourceStream(relativeDefaultIconPath.Replace("resource://", ""))) {
+                        if (resourceStream != null) {
+                            using (var image = System.Drawing.Image.FromStream(resourceStream, false, false)) {
+                                iconWidth = image.Width;
+                                iconHeight = image.Height;
+                            }
+                        }
+                    }
+                }
+            }
+            else if (File.Exists(iconPath)) {
+                using (var fileStream = new FileStream(iconPath, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+                    using (var image = System.Drawing.Image.FromStream(fileStream, false, false)) {
+                        iconWidth = image.Width;
+                        iconHeight = image.Height;
+                    }
+                }
+            }
+        }
+
+        // if the icon is not a square, use the default icon
+        // or treat it as wallpaper if the mode is set to "wallpaper"
+        var frame = "";
+        if (mode == IconElementsMode.Wallpaper) {
+            frame = "&amp;frame=pc";
+        }
+        else if (iconWidth != iconHeight) {
+            // if the icon is not a square, use the default icon instead
+            if (mode == IconElementsMode.Icon) {
+                iconPath = defaultIconPath;
+                relativeExtenesionlessIconPath = relativeDefaultIconPath;
+
+                // set the dimensions to match the default icon dimensions. The default icon path
+                // may be an embedded assembly resource (resource://...) or a real file on disk.
+                iconWidth = 0;
+#pragma warning disable IDE0059 // Unnecessary assignment of a value
+                iconHeight = 0;
+#pragma warning restore IDE0059 // Unnecessary assignment of a value
+                if (relativeDefaultIconPath.StartsWith("resource://")) {
+                    if (serverAssembly != null) {
+                        using (var resourceStream = serverAssembly.GetManifestResourceStream(relativeDefaultIconPath.Replace("resource://", ""))) {
+                            if (resourceStream != null) {
+                                using (var image = System.Drawing.Image.FromStream(resourceStream, false, false)) {
+                                    iconWidth = image.Width;
+                                    iconHeight = image.Height;
+                                }
+                            }
+                        }
+                    }
+                }
+                else if (File.Exists(iconPath)) {
+                    using (var fileStream = new FileStream(iconPath, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+                        using (var image = System.Drawing.Image.FromStream(fileStream, false, false)) {
+                            iconWidth = image.Width;
+                            iconHeight = image.Height;
+                        }
+                    }
+                }
+            }
+        }
+
+        // if the path is the default wallpaper, replace it with defaultwallpaper
+        if (relativeExtenesionlessIconPath == "resource://static/lib/assets/wallpaper.png") {
+            relativeExtenesionlessIconPath = "defaultwallpaper";
+        }
+
+        // if the path is the default icon, replace it with defaulicon
+        if (relativeExtenesionlessIconPath == "resource://static/lib/assets/default.ico") {
+            relativeExtenesionlessIconPath = "defaulticon";
+        }
+
+        // build the icons elements
+        var iconElements = "<IconRaw FileType=\"Ico\" FileURL=\"" + _iisBase + "api/resources/image/" + relativeExtenesionlessIconPath + "?format=ico" + frame + "\" />" + "\r\n";
+        if (iconWidth >= 16) {
+            iconElements += "<Icon16 Dimensions=\"16x16\" FileType=\"Png\" FileURL=\"" + _iisBase + "api/resources/image/" + relativeExtenesionlessIconPath + "?format=png16" + frame + "\" />" + "\r\n";
+        }
+        if (iconWidth >= 32) {
+            iconElements += "<Icon32 Dimensions=\"32x32\" FileType=\"Png\" FileURL=\"" + _iisBase + "api/resources/image/" + relativeExtenesionlessIconPath + "?format=png32" + frame + "\" />" + "\r\n";
+        }
+        if (iconWidth >= 48) {
+            iconElements += "<Icon48 Dimensions=\"48x48\" FileType=\"Png\" FileURL=\"" + _iisBase + "api/resources/image/" + relativeExtenesionlessIconPath + "?format=png48" + frame + "\" />" + "\r\n";
+        }
+        if (iconWidth >= 64) {
+            iconElements += "<Icon64 Dimensions=\"64x64\" FileType=\"Png\" FileURL=\"" + _iisBase + "api/resources/image/" + relativeExtenesionlessIconPath + "?format=png64" + frame + "\" />" + "\r\n";
+        }
+        if (iconWidth >= 100) {
+            iconElements += "<Icon100 Dimensions=\"100x100\" FileType=\"Png\" FileURL=\"" + _iisBase + "api/resources/image/" + relativeExtenesionlessIconPath + "?format=png100" + frame + "\" />" + "\r\n";
+        }
+        if (iconWidth >= 256) {
+            iconElements += "<Icon256 Dimensions=\"256x256\" FileType=\"Png\" FileURL=\"" + _iisBase + "api/resources/image/" + relativeExtenesionlessIconPath + "?format=png256" + frame + "\" />" + "\r\n";
+        }
+
+        return iconElements;
+    }
+}
+
+[System.Text.Json.Serialization.JsonSourceGenerationOptions(
+    PropertyNamingPolicy = System.Text.Json.Serialization.JsonKnownNamingPolicy.CamelCase,
+    WriteIndented = true)]
+[System.Text.Json.Serialization.JsonSerializable(typeof(UserInformation))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(Dictionary<string, string>))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SystemRemoteApps.SystemRemoteAppCollection))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SystemDesktop))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(ManagedFileResources))]
+internal partial class WorkspaceDebugJsonContext : System.Text.Json.Serialization.JsonSerializerContext { }

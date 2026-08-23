@@ -1,0 +1,481 @@
+<!-- Note: Install vue with npm if you want vscode to not show import errors. -->
+<!-- First, set your working directiry to the /app folder. Then, run: -->
+<!-- npm install vue@3.5.13 vue-router@4.5.0 devalue@5.1.1 -->
+<!-- Generated files will be ignored by Git. -->
+
+<script setup lang="ts">
+  import {
+    Button,
+    InfoBar,
+    NavigationRail,
+    ProgressRing,
+    SettingsNavBar,
+    TextBlock,
+    Titlebar,
+  } from '$components';
+  import { BulkImportDialog } from '$dialogs';
+  import { useCoreDataStore } from '$stores';
+  import {
+    combineTerminalServersModeEnabled,
+    openInfoBarPopup,
+    openSignInPagePopup,
+    PreventableEvent,
+    registerServiceWorker,
+    removeSplashScreen,
+    simpleModeEnabled,
+    useUpdateDetails,
+    useWebfeedData,
+  } from '$utils';
+  import { hidePortsEnabled } from '$utils/hidePorts';
+  import { entranceIn, expandDown, fadeOut } from '$utils/transitions';
+  import { useQueryClient } from '@tanstack/vue-query';
+  import { useTranslation } from 'i18next-vue';
+  import { computed, onMounted, ref, watch, watchEffect } from 'vue';
+  import { NavigationGuardReturn, useRouter } from 'vue-router';
+  import { i18nextPromise } from './i18n';
+
+  // TODO: requestClose: remove this logic once all browsers have supported this for some time
+  const canUseDialogs = HTMLDialogElement.prototype.requestClose !== undefined;
+  const falseWritableComputedRef = computed({
+    get: () => false,
+    set: () => {},
+  });
+
+  const router = useRouter();
+  const queryClient = useQueryClient();
+  const coreAppData = useCoreDataStore();
+  const { t } = useTranslation();
+
+  const supportsCentralizedPublishing = computed(() => {
+    return coreAppData.capabilities.supportsCentralizedPublishing || false;
+  });
+
+  const webfeedOptions = {
+    mergeTerminalServers:
+      canUseDialogs === false ? falseWritableComputedRef : combineTerminalServersModeEnabled,
+    hidePortsWhenPossible: hidePortsEnabled,
+    supportsCentralizedPublishing,
+  };
+  const { data, loading, error, refresh } = useWebfeedData(coreAppData.iisBase, webfeedOptions);
+
+  // refresh the webfeed when combineTerminalServersModeEnabled changes,
+  // but revert the change if there is an error (e.g., if the server is unreachable)
+  let combineTerminalServersModeEnabledRevertValue: boolean | null = null;
+  watch(combineTerminalServersModeEnabled, async (newValue, oldValue) => {
+    // do not refresh if the value has been reverted
+    if (newValue === combineTerminalServersModeEnabledRevertValue) {
+      return;
+    }
+
+    // refresh the webfeed with the new value
+    const { error } = await refresh(webfeedOptions);
+
+    // if there is an error, revert the value back to the old value
+    // and set the revert value to the old value to prevent an infinite loop
+    if (error.value !== null) {
+      if (combineTerminalServersModeEnabledRevertValue === null) {
+        combineTerminalServersModeEnabledRevertValue = oldValue;
+      }
+      combineTerminalServersModeEnabled.value = combineTerminalServersModeEnabledRevertValue;
+    }
+
+    // if there is no error, set the revert value to null
+    // because the value has been successfully changed
+    // and we do not need to revert it anymore
+    else {
+      combineTerminalServersModeEnabledRevertValue = null;
+    }
+  });
+
+  // refresh the webfeed when hidePortsEnabled changes
+  let hidePortsEnabledRevertValue: boolean | null = null;
+  watch(hidePortsEnabled, async (newValue, oldValue) => {
+    // do not refresh if the value has been reverted
+    if (newValue === hidePortsEnabledRevertValue) {
+      return;
+    }
+
+    // refresh the webfeed with the new value
+    const { error } = await refresh(webfeedOptions);
+
+    // if there is an error, revert the value back to the old value
+    // and set the revert value to the old value to prevent an infinite loop
+    if (error.value !== null) {
+      if (hidePortsEnabledRevertValue === null) {
+        hidePortsEnabledRevertValue = oldValue;
+      }
+      hidePortsEnabled.value = hidePortsEnabledRevertValue;
+    }
+
+    // if there is no error, set the revert value to null
+    // because the value has been successfully changed
+    // and we do not need to revert it anymore
+    else {
+      hidePortsEnabledRevertValue = null;
+    }
+  });
+
+  const sslError = ref(false);
+
+  const titlebarLoading = ref(false);
+  async function listenToServiceWorker(event: any) {
+    if (event.data.type === 'fetch-queue') {
+      const fetching = event.data.backgroundFetchQueueLength > 0;
+      titlebarLoading.value = fetching;
+    }
+  }
+
+  onMounted(() => {
+    registerServiceWorker(listenToServiceWorker).then((response) => {
+      if (response === 'SSL_ERROR') {
+        sslError.value = true;
+      }
+    });
+  });
+
+  // track whether i18n is ready
+  const i18nReady = ref(false);
+  i18nextPromise.then(() => {
+    i18nReady.value = true;
+  });
+
+  // track whether the component has been mounted
+  const mounted = ref(false);
+  onMounted(() => {
+    mounted.value = true;
+  });
+
+  const canRemoveSplashScreen = computed(() => {
+    return mounted.value && data.value && !error.value && i18nReady.value;
+  });
+  watchEffect(() => {
+    if (canRemoveSplashScreen.value) {
+      removeSplashScreen();
+    }
+  });
+
+  // track whether the app should show animations, including view transitions
+  let prefersReducedMotion = true;
+  onMounted(() => {
+    const prefersReducedMotionMediaQueryList = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+    function updatePrefersReducedMotion() {
+      prefersReducedMotion = prefersReducedMotionMediaQueryList.matches;
+    }
+
+    prefersReducedMotionMediaQueryList.addEventListener('change', updatePrefersReducedMotion);
+    prefersReducedMotion = prefersReducedMotionMediaQueryList.matches;
+
+    return () => {
+      prefersReducedMotionMediaQueryList.removeEventListener('change', updatePrefersReducedMotion);
+    };
+  });
+
+  router.beforeResolve(async (to, from) => {
+    return new Promise<NavigationGuardReturn>(async (next) => {
+      const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+      if (!document.startViewTransition || prefersReducedMotion) {
+        return next();
+      }
+
+      // if the splash screen is visible, we should not start a view transition
+      const splashScreen = document.querySelector<HTMLDivElement>('.root-splash-wrapper');
+      const splashScreenVisible = splashScreen && splashScreen.style.display !== 'none';
+      if (splashScreenVisible) {
+        return next();
+      }
+
+      const mainElem = document.querySelector('main');
+      const mainChildElem = mainElem ? mainElem.querySelector('div#page') : null;
+
+      const navRailWillHide = to.name === 'webGuacd' && from.name !== 'webGuacd';
+      const navRailWillShow = to.name !== 'webGuacd' && from.name === 'webGuacd';
+      const navRailElem = document.querySelector('#appContent > .nav-rail');
+
+      const isBetweenSettingsPages = to.path.startsWith('/settings') && from.path.startsWith('/settings');
+
+      const settingsPagesOrder = router
+        .getRoutes()
+        .filter((route) => route.name === 'settingsHub')
+        .flatMap((route) => route.children || [])
+        .map((route) => (route.path === '' ? '/settings' : `/settings/${route.path}`));
+      const toSettingsPageIndex = settingsPagesOrder.findIndex((path) => path === to.path);
+      const fromSettingsPageIndex = settingsPagesOrder.findIndex((path) => path === from.path);
+      const settingsPageTransitionDirection =
+        toSettingsPageIndex !== -1 && fromSettingsPageIndex !== -1
+          ? toSettingsPageIndex > fromSettingsPageIndex
+            ? 'left'
+            : 'right'
+          : 'up';
+
+      const settingsNavWillHide = from.path.startsWith('/settings') && !to.path.startsWith('/settings');
+      const settingsNavWillShow = !from.path.startsWith('/settings') && to.path.startsWith('/settings');
+      const settingsNavElem = document.querySelector('#appContent > .app-content-stack > .settings-nav');
+
+      // fade out, then navigate, then wait for render, then play entrance animation
+      await Promise.allSettled([
+        fadeOut(mainChildElem),
+        navRailWillHide && fadeOut(navRailElem),
+        settingsNavWillHide && fadeOut(settingsNavElem),
+      ]);
+      next();
+      if (settingsNavWillShow) {
+        expandDown(settingsNavElem, {
+          startOpacity: 0,
+          startHeight: 0,
+          endHeight: settingsNavElem?.scrollHeight,
+          endPadding: { top: 0, right: 0, bottom: 4, left: 0 },
+        });
+      }
+      if (settingsNavWillHide) {
+        expandDown(settingsNavElem, {
+          endOpacity: 0, // we already hide it with fadeOut, so we need to keep it hidden
+          startHeight: settingsNavElem?.scrollHeight,
+          endHeight: 0,
+          endPadding: { top: 0, right: 0, bottom: 0, left: 0 },
+        });
+      }
+      setTimeout(() => {
+        entranceIn(
+          mainChildElem,
+          undefined,
+          undefined,
+          undefined,
+          isBetweenSettingsPages ? settingsPageTransitionDirection : 'up'
+        );
+        if (navRailWillShow) {
+          entranceIn(navRailElem);
+        }
+      }, 0);
+    });
+  });
+
+  const { updateDetails, populateUpdateDetails } = useUpdateDetails();
+  onMounted(() => {
+    populateUpdateDetails();
+  });
+
+  const signedInUserGlobalAlerts = (() => {
+    const alertsJson = coreAppData.policies.signedInUserGlobalAlerts;
+    if (!alertsJson) {
+      return [];
+    }
+
+    try {
+      const alerts = JSON.parse(alertsJson);
+      if (!Array.isArray(alerts)) {
+        return [];
+      }
+      return alerts.filter(
+        (
+          alert
+        ): alert is {
+          title?: string;
+          message?: string;
+          linkText?: string;
+          linkHref?: string;
+          type?: 'information' | 'attention';
+        } =>
+          (alert && typeof alert === 'object' && typeof alert.title === 'string') ||
+          (alert.title === undefined && typeof alert.message === 'string') ||
+          (alert.message === undefined &&
+            (typeof alert.linkText === 'string' || alert.linkText === undefined) &&
+            (typeof alert.linkHref === 'string' || alert.linkHref === undefined) &&
+            (alert.type === 'information' || alert.type === 'attention' || alert.type === undefined))
+      );
+    } catch {
+      return [];
+    }
+  })();
+
+  const securityErrorHelpHref = `${coreAppData.docsUrl}/security/error-5003/`;
+
+  const isPopup = computed(() => typeof window !== 'undefined' && window.opener && window.opener !== window);
+
+  async function handleAppOrDesktopChange(event: PreventableEvent<{ next: () => void }>) {
+    event.preventDefault();
+    await refresh();
+    queryClient.invalidateQueries({ queryKey: ['remote-app-registry'] });
+
+    // wrap in setTimeout so that the updated resources list can fully render
+    // before the dialog is closed
+    setTimeout(() => {
+      event.detail.next();
+    }, 0);
+  }
+</script>
+
+<template>
+  <Titlebar :forceVisible="!isPopup" :loading="titlebarLoading || loading" :update="updateDetails" />
+
+  <BulkImportDialog #default="{ dropZoneHandler }" @after-save="handleAppOrDesktopChange">
+    <div id="appContent" v-drop-zone="dropZoneHandler">
+      <NavigationRail
+        v-if="!simpleModeEnabled"
+        :hidden="router.currentRoute.value.name === 'webGuacd'"
+        :refresh-workspace="refresh"
+      />
+
+      <div class="app-content-stack">
+        <SettingsNavBar
+          :hidden="!router.currentRoute.value.path.startsWith('/settings')"
+          :simple-mode-enabled="simpleModeEnabled"
+        />
+
+        <main :class="{ simple: simpleModeEnabled }">
+          <InfoBar
+            severity="critical"
+            v-if="coreAppData.needsSignInAgain"
+            :title="t('needsSignInAgain.title') + '.'"
+            style="border-radius: 0"
+          >
+            {{ t('needsSignInAgain.message') }}
+            <Button
+              variant="hyperlink"
+              style="margin: -6px 0 -6px -3px"
+              target="_blank"
+              @click.prevent="openSignInPagePopup('sign-in-again', () => refresh())"
+            >
+              {{ t('needsSignInAgain.action') }}
+            </Button>
+          </InfoBar>
+
+          <InfoBar
+            severity="caution"
+            v-if="sslError"
+            :title="t('securityError503.title')"
+            style="border-radius: 0"
+          >
+            {{ t('securityError503.message') }}
+            <br />
+            <Button
+              variant="hyperlink"
+              :href="securityErrorHelpHref"
+              style="margin-left: -11px; margin-bottom: -6px"
+              target="_blank"
+              @click.prevent="openInfoBarPopup(securityErrorHelpHref, 'help')"
+            >
+              {{ t('securityError503.action') }}
+            </Button>
+          </InfoBar>
+
+          <InfoBar
+            v-for="(alert, index) in signedInUserGlobalAlerts"
+            :key="index"
+            :severity="alert.type || 'attention'"
+            :title="alert.title"
+            class="global-alert"
+          >
+            {{ alert.message }}
+            <template v-if="alert.linkText && alert.linkHref">
+              <br />
+              <Button
+                variant="hyperlink"
+                :href="alert.linkHref"
+                style="margin-left: -11px; margin-bottom: -6px"
+                target="_blank"
+                @click.prevent="openInfoBarPopup(alert.linkHref, alert.title || `alert-link-${index}`)"
+              >
+                {{ alert.linkText }}
+              </Button>
+            </template>
+          </InfoBar>
+
+          <div id="page">
+            <router-view v-slot="{ Component }" v-if="data">
+              <component
+                :is="Component"
+                :data="data"
+                :update="updateDetails"
+                :workspace="data"
+                :refresh-workspace="refresh"
+              />
+            </router-view>
+            <div v-else>
+              <TextBlock variant="title">Loading</TextBlock>
+              <br />
+              <br />
+              <div style="display: flex; gap: 8px; align-items: center">
+                <ProgressRing :size="24" />
+                <TextBlock style="font-weight: 500">{{ t('pleaseWait') }}</TextBlock>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+  </BulkImportDialog>
+</template>
+
+<style scoped>
+  .app-content-stack {
+    display: flex;
+    flex-direction: column;
+    flex-grow: 1;
+    flex-shrink: 1;
+    min-width: 0;
+  }
+
+  main {
+    flex-grow: 1;
+    flex-shrink: 1;
+    flex-basis: 0%;
+
+    height: var(--content-height);
+    overflow: hidden;
+    background-color: var(--wui-layer-default);
+    box-sizing: border-box;
+    border-radius: var(--wui-overlay-corner-radius) 0 0 0;
+
+    display: flex;
+    flex-direction: column;
+  }
+  main.simple {
+    border-radius: 0;
+  }
+
+  main > div#page {
+    --padding: 36px;
+    padding: var(--padding);
+    width: 100%;
+    box-sizing: border-box;
+    view-transition-name: main;
+    overflow: auto;
+    flex-grow: 1;
+    flex-shrink: 1;
+  }
+
+  :deep(.global-alert) {
+    border-radius: 0 !important;
+  }
+  :deep(.global-alert .info-bar-content p) {
+    flex-basis: 100%;
+  }
+</style>
+
+<style>
+  ::view-transition-group(disabled),
+  ::view-transition-old(disabled),
+  ::view-transition-new(disabled) {
+    animation-duration: 0s !important;
+  }
+
+  @keyframes entrance {
+    from {
+      transform: translateY(120px);
+      opacity: 0;
+    }
+  }
+
+  ::view-transition-old(main) {
+    animation: var(--wui-view-transition-fade-out) cubic-bezier(0.16, 1, 0.3, 1) both fade-out;
+  }
+
+  ::view-transition-new(main) {
+    animation:
+      var(--wui-view-transition-fade-in) cubic-bezier(0.16, 1, 0.3, 1) var(--wui-view-transition-fade-out) both
+        fade-in,
+      var(--wui-view-transition-slide-in) cubic-bezier(0.16, 1, 0.3, 1) both entrance;
+  }
+</style>
