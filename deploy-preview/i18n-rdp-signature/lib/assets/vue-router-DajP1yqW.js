@@ -1,0 +1,1 @@
+import{ft as e}from"./shared-DBU4W_LD.js";export{e as RouterLink};
